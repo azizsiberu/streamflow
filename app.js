@@ -1141,10 +1141,18 @@ app.post('/settings/integrations/gdrive', isAuthenticated, [
 });
 app.post('/upload/video', isAuthenticated, uploadVideo.single('video'), async (req, res) => {
   try {
-    console.log('Upload request received:', req.file);
-    console.log('Session userId for upload:', req.session.userId);
-    
+    console.log('[Upload] /upload/video hit', {
+      userId: req.session?.userId || null,
+      hasFile: !!req.file,
+      filename: req.file?.originalname,
+      mimetype: req.file?.mimetype
+    });
+
     if (!req.file) {
+      console.warn('[Upload] No file provided on /upload/video request', {
+        bodyKeys: Object.keys(req.body || {}),
+        query: req.query
+      });
       return res.status(400).json({ error: 'No video file provided' });
     }
     const { filename, originalname, path: videoPath, mimetype, size } = req.file;
@@ -1152,7 +1160,13 @@ app.post('/upload/video', isAuthenticated, uploadVideo.single('video'), async (r
     const videoInfo = await getVideoInfo(videoPath);
     const thumbnailRelativePath = await generateThumbnail(videoPath, thumbnailName)
       .then(() => `/uploads/thumbnails/${thumbnailName}`)
-      .catch(() => null);
+      .catch((thumbErr) => {
+        console.error('[Upload] Thumbnail generation failed', {
+          filename,
+          error: thumbErr?.message
+        });
+        return null;
+      });
     let format = 'unknown';
     if (mimetype === 'video/mp4') format = 'mp4';
     else if (mimetype === 'video/avi') format = 'avi';
@@ -1167,7 +1181,15 @@ app.post('/upload/video', isAuthenticated, uploadVideo.single('video'), async (r
       format: format,
       user_id: req.session.userId
     };
+    console.log('[Upload] Saving video metadata', {
+      userId: videoData.user_id,
+      filepath: videoData.filepath,
+      thumbnail: videoData.thumbnail_path,
+      format: videoData.format,
+      duration: videoData.duration
+    });
     const video = await Video.create(videoData);
+    console.log('[Upload] Video saved successfully', { videoId: video.id });
     res.json({
       success: true,
       video: {
@@ -1181,7 +1203,11 @@ app.post('/upload/video', isAuthenticated, uploadVideo.single('video'), async (r
       }
     });
   } catch (error) {
-    console.error('Upload error details:', error);
+    console.error('[Upload] /upload/video failed', {
+      userId: req.session?.userId || null,
+      error: error?.message,
+      stack: error?.stack
+    });
     res.status(500).json({ 
       error: 'Failed to upload video',
       details: error.message 
@@ -1189,8 +1215,16 @@ app.post('/upload/video', isAuthenticated, uploadVideo.single('video'), async (r
   }
 });
 app.post('/api/videos/upload', isAuthenticated, (req, res, next) => {
+  console.log('[Upload] /api/videos/upload hit', {
+    userId: req.session?.userId || null,
+    hasFile: !!req.file
+  });
   uploadVideo.single('video')(req, res, (err) => {
     if (err) {
+      console.error('[Upload] Multer error on /api/videos/upload', {
+        code: err.code,
+        message: err.message
+      });
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(413).json({ 
           success: false, 
@@ -1213,6 +1247,10 @@ app.post('/api/videos/upload', isAuthenticated, (req, res, next) => {
 }, async (req, res) => {
   try {
     if (!req.file) {
+      console.warn('[Upload] No file provided for /api/videos/upload after middleware', {
+        bodyKeys: Object.keys(req.body || {}),
+        query: req.query
+      });
       return res.status(400).json({ 
         success: false, 
         error: 'No video file provided' 
@@ -1269,6 +1307,10 @@ app.post('/api/videos/upload', isAuthenticated, (req, res, next) => {
                 user_id: req.session.userId
               };
               const video = await Video.create(videoData);
+              console.log('[Upload] Video saved via /api/videos/upload', {
+                videoId: video.id,
+                userId: req.session?.userId || null
+              });
               res.json({
                 success: true,
                 message: 'Video uploaded successfully',
@@ -1281,13 +1323,20 @@ app.post('/api/videos/upload', isAuthenticated, (req, res, next) => {
             }
           })
           .on('error', (err) => {
-            console.error('Error creating thumbnail:', err);
+            console.error('[Upload] Error creating thumbnail via ffmpeg', {
+              error: err?.message,
+              videoPath: fullFilePath
+            });
             reject(err);
           });
       });
     });
   } catch (error) {
-    console.error('Upload error details:', error);
+    console.error('[Upload] /api/videos/upload failed', {
+      userId: req.session?.userId || null,
+      error: error?.message,
+      stack: error?.stack
+    });
     res.status(500).json({ 
       error: 'Failed to upload video',
       details: error.message 
