@@ -16,32 +16,34 @@ class Stream {
       orientation = 'horizontal',
       loop_video = true,
       schedule_time = null,
+      end_time = null,
       duration = null,
       use_advanced_settings = false,
+      status,
       user_id
     } = streamData;
     const loop_video_int = loop_video ? 1 : 0;
     const use_advanced_settings_int = use_advanced_settings ? 1 : 0;
-    const status = schedule_time ? 'scheduled' : 'offline';
+    const final_status = status || (schedule_time ? 'scheduled' : 'offline');
     const status_updated_at = new Date().toISOString();
     return new Promise((resolve, reject) => {
       db.run(
         `INSERT INTO streams (
           id, title, video_id, rtmp_url, stream_key, platform, platform_icon,
           bitrate, resolution, fps, orientation, loop_video,
-          schedule_time, duration, status, status_updated_at, use_advanced_settings, user_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          schedule_time, end_time, duration, status, status_updated_at, use_advanced_settings, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, title, video_id, rtmp_url, stream_key, platform, platform_icon,
           bitrate, resolution, fps, orientation, loop_video_int,
-          schedule_time, duration, status, status_updated_at, use_advanced_settings_int, user_id
+          schedule_time, end_time, duration, final_status, status_updated_at, use_advanced_settings_int, user_id
         ],
         function (err) {
           if (err) {
             console.error('Error creating stream:', err.message);
             return reject(err);
           }
-          resolve({ id, ...streamData, status, status_updated_at });
+          resolve({ id, ...streamData, status: final_status, status_updated_at });
         }
       );
     });
@@ -83,19 +85,27 @@ class Stream {
         LEFT JOIN playlists p ON s.video_id = p.id
       `;
       const params = [];
+      const conditions = [];
+      
       if (userId) {
-        query += ' WHERE s.user_id = ?';
+        conditions.push('s.user_id = ?');
         params.push(userId);
-        if (filter) {
-          if (filter === 'live') {
-            query += " AND s.status = 'live'";
-          } else if (filter === 'scheduled') {
-            query += " AND s.status = 'scheduled'";
-          } else if (filter === 'offline') {
-            query += " AND s.status = 'offline'";
-          }
+      }
+      
+      if (filter) {
+        if (filter === 'live') {
+          conditions.push("s.status = 'live'");
+        } else if (filter === 'scheduled') {
+          conditions.push("s.status = 'scheduled'");
+        } else if (filter === 'offline') {
+          conditions.push("s.status = 'offline'");
         }
       }
+      
+      if (conditions.length > 0) {
+        query += ' WHERE ' + conditions.join(' AND ');
+      }
+      
       query += ' ORDER BY s.created_at DESC';
       db.all(query, params, (err, rows) => {
         if (err) {
@@ -152,26 +162,63 @@ class Stream {
       );
     });
   }
-  static updateStatus(id, status, userId) {
+  static updateStatus(id, status, userId = null, options = {}) {
     const status_updated_at = new Date().toISOString();
+    const { startTimeOverride = null, endTimeOverride = null, clearEndTime = false } = options;
     let start_time = null;
     let end_time = null;
+    
     if (status === 'live') {
-      start_time = new Date().toISOString();
-    } else if (status === 'offline') {
-      end_time = new Date().toISOString();
+      start_time = startTimeOverride || new Date().toISOString();
     }
+    if (endTimeOverride) {
+      end_time = endTimeOverride;
+    }
+    
     return new Promise((resolve, reject) => {
-      db.run(
-        `UPDATE streams SET 
-          status = ?, 
-          status_updated_at = ?, 
-          start_time = COALESCE(?, start_time), 
-          end_time = COALESCE(?, end_time),
-          updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND user_id = ?`,
-        [status, status_updated_at, start_time, end_time, id, userId],
-        function (err) {
+      let query;
+      let params;
+      
+      if (status === 'offline' && !endTimeOverride) {
+        query = `UPDATE streams SET 
+            status = ?, 
+            status_updated_at = ?, 
+            start_time = CASE WHEN ? IS NOT NULL THEN ? ELSE start_time END,
+            end_time = NULL,
+            updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`;
+        params = [
+          status,
+          status_updated_at,
+          start_time,
+          start_time,
+          id
+        ];
+      } else {
+        query = `UPDATE streams SET 
+            status = ?, 
+            status_updated_at = ?, 
+            start_time = CASE WHEN ? IS NOT NULL THEN ? ELSE start_time END, 
+            end_time = CASE WHEN ? IS NOT NULL THEN ? ELSE end_time END,
+            updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`;
+        params = [
+          status,
+          status_updated_at,
+          start_time,
+          start_time,
+          end_time,
+          end_time,
+          id
+        ];
+      }
+      
+      if (userId) {
+        query += ' AND user_id = ?';
+        params.push(userId);
+      }
+      
+      db.run(query, params, function (err) {
           if (err) {
             console.error('Error updating stream status:', err.message);
             return reject(err);
@@ -219,23 +266,6 @@ class Stream {
           resolve(row);
         }
       );
-    });
-  }
-  static async isStreamKeyInUse(streamKey, userId, excludeId = null) {
-    return new Promise((resolve, reject) => {
-      let query = 'SELECT COUNT(*) as count FROM streams WHERE stream_key = ? AND user_id = ?';
-      const params = [streamKey, userId];
-      if (excludeId) {
-        query += ' AND id != ?';
-        params.push(excludeId);
-      }
-      db.get(query, params, (err, row) => {
-        if (err) {
-          console.error('Error checking stream key:', err.message);
-          return reject(err);
-        }
-        resolve(row.count > 0);
-      });
     });
   }
   static findScheduledInRange(startTime, endTime) {

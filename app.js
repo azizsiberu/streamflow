@@ -14,13 +14,14 @@ const bcrypt = require('bcrypt');
 const { body, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const User = require('./models/User');
-const { db, checkIfUsersExist } = require('./db/database');
+const { db, checkIfUsersExist, initializeDatabase } = require('./db/database');
 const systemMonitor = require('./services/systemMonitor');
 const { uploadVideo, upload } = require('./middleware/uploadMiddleware');
 const { ensureDirectories } = require('./utils/storage');
 const { getVideoInfo, generateThumbnail } = require('./utils/videoProcessor');
 const Video = require('./models/Video');
 const Playlist = require('./models/Playlist');
+const Stream = require('./models/Stream');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const streamingService = require('./services/streamingService');
@@ -567,25 +568,69 @@ app.get('/settings', isAuthenticated, async (req, res) => {
 app.get('/history', isAuthenticated, async (req, res) => {
   try {
     const db = require('./db/database').db;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const sort = req.query.sort === 'oldest' ? 'ASC' : 'DESC';
+    const platform = req.query.platform || 'all';
+    const search = req.query.search || '';
+    const offset = (page - 1) * limit;
+
+    let whereClause = 'WHERE h.user_id = ?';
+    const params = [req.session.userId];
+
+    if (platform !== 'all') {
+      whereClause += ' AND h.platform = ?';
+      params.push(platform);
+    }
+
+    if (search) {
+      whereClause += ' AND h.title LIKE ?';
+      params.push(`%${search}%`);
+    }
+
+    const totalCount = await new Promise((resolve, reject) => {
+      db.get(
+        `SELECT COUNT(*) as count FROM stream_history h ${whereClause}`,
+        params,
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row.count);
+        }
+      );
+    });
+
     const history = await new Promise((resolve, reject) => {
       db.all(
         `SELECT h.*, v.thumbnail_path 
          FROM stream_history h 
          LEFT JOIN videos v ON h.video_id = v.id 
-         WHERE h.user_id = ? 
-         ORDER BY h.start_time DESC`,
-        [req.session.userId],
+         ${whereClause}
+         ORDER BY h.start_time ${sort}
+         LIMIT ? OFFSET ?`,
+        [...params, limit, offset],
         (err, rows) => {
           if (err) reject(err);
           else resolve(rows);
         }
       );
     });
+
+    const totalPages = Math.ceil(totalCount / limit);
+
     res.render('history', {
       active: 'history',
       title: 'Stream History',
       history: history,
-      helpers: app.locals.helpers
+      helpers: app.locals.helpers,
+      pagination: {
+        page,
+        limit,
+        totalCount,
+        totalPages,
+        sort: req.query.sort || 'newest',
+        platform,
+        search
+      }
     });
   } catch (error) {
     console.error('Error fetching stream history:', error);
@@ -1104,6 +1149,64 @@ app.get('/settings', isAuthenticated, async (req, res) => {
     res.redirect('/dashboard');
   }
 });
+
+app.get('/api/settings/logs', isAuthenticated, async (req, res) => {
+  try {
+    const logPath = path.join(__dirname, 'logs', 'app.log');
+    const lines = parseInt(req.query.lines) || 200;
+    const filter = req.query.filter || '';
+
+    if (!fs.existsSync(logPath)) {
+      return res.json({ success: true, logs: [], message: 'Log file not found' });
+    }
+
+    const stats = fs.statSync(logPath);
+    const fileSize = stats.size;
+
+    const maxReadSize = 5 * 1024 * 1024;
+    let content = '';
+
+    if (fileSize > maxReadSize) {
+      const fd = fs.openSync(logPath, 'r');
+      const buffer = Buffer.alloc(maxReadSize);
+      fs.readSync(fd, buffer, 0, maxReadSize, fileSize - maxReadSize);
+      fs.closeSync(fd);
+      content = buffer.toString('utf8');
+      const firstNewline = content.indexOf('\n');
+      if (firstNewline > 0) {
+        content = content.substring(firstNewline + 1);
+      }
+    } else {
+      content = fs.readFileSync(logPath, 'utf8');
+    }
+
+    let logLines = content.split('\n').filter(line => line.trim());
+
+    if (filter) {
+      const filterLower = filter.toLowerCase();
+      logLines = logLines.filter(line => line.toLowerCase().includes(filterLower));
+    }
+
+    logLines = logLines.slice(-lines);
+
+    res.json({ success: true, logs: logLines });
+  } catch (error) {
+    console.error('Error reading logs:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/settings/logs/clear', isAuthenticated, async (req, res) => {
+  try {
+    const logPath = path.join(__dirname, 'logs', 'app.log');
+    fs.writeFileSync(logPath, '');
+    res.json({ success: true, message: 'Logs cleared successfully' });
+  } catch (error) {
+    console.error('Error clearing logs:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.post('/settings/integrations/gdrive', isAuthenticated, [
   body('apiKey').notEmpty().withMessage('API Key is required'),
 ], async (req, res) => {
@@ -1681,8 +1784,7 @@ app.get('/api/stream/content', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Failed to load content' });
   }
 });
-const Stream = require('./models/Stream');
-const { title } = require('process');
+
 app.get('/api/streams', isAuthenticated, async (req, res) => {
   try {
     const filter = req.query.filter;
@@ -1703,13 +1805,6 @@ app.post('/api/streams', isAuthenticated, [
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ success: false, error: errors.array()[0].msg });
-    }
-    const isInUse = await Stream.isStreamKeyInUse(req.body.streamKey, req.session.userId);
-    if (isInUse) {
-      return res.status(400).json({
-        success: false,
-        error: 'This stream key is already in use. Please use a different key.'
-      });
     }
     let platform = 'Custom';
     let platform_icon = 'ti-broadcast';
@@ -1750,21 +1845,44 @@ app.post('/api/streams', isAuthenticated, [
       use_advanced_settings: req.body.useAdvancedSettings === 'true' || req.body.useAdvancedSettings === true,
       user_id: req.session.userId
     };
-    if (req.body.scheduleTime) {
-      const scheduleDate = new Date(req.body.scheduleTime);
+    const serverTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    
+    function parseLocalDateTime(dateTimeString) {
+      const [datePart, timePart] = dateTimeString.split('T');
+      const [year, month, day] = datePart.split('-').map(Number);
+      const [hours, minutes] = timePart.split(':').map(Number);
       
-      const serverTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      console.log(`[CREATE STREAM] Server timezone: ${serverTimezone}`);
-      console.log(`[CREATE STREAM] Input time: ${req.body.scheduleTime}`);
-      console.log(`[CREATE STREAM] Parsed time: ${scheduleDate.toISOString()}`);
-      console.log(`[CREATE STREAM] Local display: ${scheduleDate.toLocaleString('en-US', { timeZone: serverTimezone })}`);
+      return new Date(year, month - 1, day, hours, minutes);
+    }
+    
+    if (req.body.scheduleStartTime) {
+      const scheduleStartDate = parseLocalDateTime(req.body.scheduleStartTime);
+      streamData.schedule_time = scheduleStartDate.toISOString();
+      streamData.status = 'scheduled';
       
-      streamData.schedule_time = scheduleDate.toISOString();
+      if (req.body.scheduleEndTime) {
+        const scheduleEndDate = parseLocalDateTime(req.body.scheduleEndTime);
+        
+        if (scheduleEndDate <= scheduleStartDate) {
+          return res.status(400).json({ 
+            success: false, 
+            error: 'End time must be after start time' 
+          });
+        }
+        
+        streamData.end_time = scheduleEndDate.toISOString();
+        const durationMs = scheduleEndDate - scheduleStartDate;
+        const durationMinutes = Math.round(durationMs / (1000 * 60));
+        streamData.duration = durationMinutes > 0 ? durationMinutes : null;
+      }
+    } else if (req.body.scheduleEndTime) {
+      const scheduleEndDate = parseLocalDateTime(req.body.scheduleEndTime);
+      streamData.end_time = scheduleEndDate.toISOString();
     }
-    if (req.body.duration) {
-      streamData.duration = parseInt(req.body.duration);
+    
+    if (!streamData.status) {
+      streamData.status = 'offline';
     }
-    streamData.status = req.body.scheduleTime ? 'scheduled' : 'offline';
     const stream = await Stream.create(streamData);
     res.json({ success: true, stream });
   } catch (error) {
@@ -1799,7 +1917,38 @@ app.put('/api/streams/:id', isAuthenticated, async (req, res) => {
     const updateData = {};
     if (req.body.streamTitle) updateData.title = req.body.streamTitle;
     if (req.body.videoId) updateData.video_id = req.body.videoId;
-    if (req.body.rtmpUrl) updateData.rtmp_url = req.body.rtmpUrl;
+    
+    if (req.body.rtmpUrl) {
+      updateData.rtmp_url = req.body.rtmpUrl;
+      
+      let platform = 'Custom';
+      let platform_icon = 'ti-broadcast';
+      if (req.body.rtmpUrl.includes('youtube.com')) {
+        platform = 'YouTube';
+        platform_icon = 'ti-brand-youtube';
+      } else if (req.body.rtmpUrl.includes('facebook.com')) {
+        platform = 'Facebook';
+        platform_icon = 'ti-brand-facebook';
+      } else if (req.body.rtmpUrl.includes('twitch.tv')) {
+        platform = 'Twitch';
+        platform_icon = 'ti-brand-twitch';
+      } else if (req.body.rtmpUrl.includes('tiktok.com')) {
+        platform = 'TikTok';
+        platform_icon = 'ti-brand-tiktok';
+      } else if (req.body.rtmpUrl.includes('instagram.com')) {
+        platform = 'Instagram';
+        platform_icon = 'ti-brand-instagram';
+      } else if (req.body.rtmpUrl.includes('shopee.io')) {
+        platform = 'Shopee Live';
+        platform_icon = 'ti-brand-shopee';
+      } else if (req.body.rtmpUrl.includes('restream.io')) {
+        platform = 'Restream.io';
+        platform_icon = 'ti-live-photo';
+      }
+      updateData.platform = platform;
+      updateData.platform_icon = platform_icon;
+    }
+    
     if (req.body.streamKey) updateData.stream_key = req.body.streamKey;
     if (req.body.bitrate) updateData.bitrate = parseInt(req.body.bitrate);
     if (req.body.resolution) updateData.resolution = req.body.resolution;
@@ -1811,20 +1960,56 @@ app.put('/api/streams/:id', isAuthenticated, async (req, res) => {
     if (req.body.useAdvancedSettings !== undefined) {
       updateData.use_advanced_settings = req.body.useAdvancedSettings === 'true' || req.body.useAdvancedSettings === true;
     }
-    if (req.body.scheduleTime) {
-      const scheduleDate = new Date(req.body.scheduleTime);
+    const serverTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    
+    function parseLocalDateTime(dateTimeString) {
+      const [datePart, timePart] = dateTimeString.split('T');
+      const [year, month, day] = datePart.split('-').map(Number);
+      const [hours, minutes] = timePart.split(':').map(Number);
       
-      const serverTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      console.log(`[UPDATE STREAM] Server timezone: ${serverTimezone}`);
-      console.log(`[UPDATE STREAM] Input time: ${req.body.scheduleTime}`);
-      console.log(`[UPDATE STREAM] Parsed time: ${scheduleDate.toISOString()}`);
-      console.log(`[UPDATE STREAM] Local display: ${scheduleDate.toLocaleString('en-US', { timeZone: serverTimezone })}`);
-      
-      updateData.schedule_time = scheduleDate.toISOString();
+      return new Date(year, month - 1, day, hours, minutes);
+    }
+    
+    if (req.body.scheduleStartTime) {
+      const scheduleStartDate = parseLocalDateTime(req.body.scheduleStartTime);
+      updateData.schedule_time = scheduleStartDate.toISOString();
       updateData.status = 'scheduled';
-    } else if ('scheduleTime' in req.body && !req.body.scheduleTime) {
+      
+      if (req.body.scheduleEndTime) {
+        const scheduleEndDate = parseLocalDateTime(req.body.scheduleEndTime);
+        
+        if (scheduleEndDate <= scheduleStartDate) {
+          return res.status(400).json({ 
+            success: false, 
+            error: 'End time must be after start time' 
+          });
+        }
+        
+        updateData.end_time = scheduleEndDate.toISOString();
+        const durationMs = scheduleEndDate - scheduleStartDate;
+        const durationMinutes = Math.round(durationMs / (1000 * 60));
+        updateData.duration = durationMinutes > 0 ? durationMinutes : null;
+      } else if ('scheduleEndTime' in req.body && req.body.scheduleEndTime === '') {
+        updateData.end_time = null;
+        updateData.duration = null;
+      }
+    } else if ('scheduleStartTime' in req.body && !req.body.scheduleStartTime) {
       updateData.schedule_time = null;
       updateData.status = 'offline';
+      
+      if (req.body.scheduleEndTime) {
+        const scheduleEndDate = parseLocalDateTime(req.body.scheduleEndTime);
+        updateData.end_time = scheduleEndDate.toISOString();
+      } else if ('scheduleEndTime' in req.body && req.body.scheduleEndTime === '') {
+        updateData.end_time = null;
+        updateData.duration = null;
+      }
+    } else if (req.body.scheduleEndTime) {
+      const scheduleEndDate = parseLocalDateTime(req.body.scheduleEndTime);
+      updateData.end_time = scheduleEndDate.toISOString();
+    } else if ('scheduleEndTime' in req.body && req.body.scheduleEndTime === '') {
+      updateData.end_time = null;
+      updateData.duration = null;
     }
     
     const updatedStream = await Stream.update(req.params.id, updateData);
@@ -2219,6 +2404,13 @@ app.get('/api/server-time', (req, res) => {
   });
 });
 const server = app.listen(port, '0.0.0.0', async () => {
+  try {
+    await initializeDatabase();
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+    process.exit(1);
+  }
+  
   const ipAddresses = getLocalIpAddresses();
   console.log(`StreamFlow running at:`);
   if (ipAddresses && ipAddresses.length > 0) {
